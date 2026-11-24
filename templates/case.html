@@ -13,11 +13,55 @@
     全区共用同一个排除选择，至多排除一张原照；被标为可靠的照片必须保留，
     不能作为排除候选。更改标记后将自动重新求解并更新推荐。
   </p>
+  {% if demo_variant == 'shadow' %}
+  <p class="hint">
+    当前载入的是阴影诊断演示：第 1 张原照左上角受支架投影压暗。
+    先在下方“阴影诊断”里对第 1 张做诊断并启用唯一最优掩膜，再观察选灯推荐。
+  </p>
+  {% endif %}
   <div id="thumbs" class="thumbs"></div>
 </section>
 
 <section class="card">
-  <h2>3. 点选刻线与底面像素对（1～4 对，每对两点不同）</h2>
+  <h2>3. 阴影诊断（可选）</h2>
+  <p class="hint">
+    支架的投影可能只压暗原照的一角。选一张原照做诊断：全组原照都参与，
+    沿用反射向量模型；被诊断为阴影的像素要求该原照的预测灰度至少比实拍高
+    3，其余观测仍用 ±2 容差。求解边界最短（四邻接阴影/非阴影边数最少）
+    的可行掩膜；只有唯一最优掩膜才能启用，每个案例同时最多启用一张。
+  </p>
+  <div class="shadow-controls">
+    <label>诊断原照
+      <select id="shadow-source"></select>
+    </label>
+    <button id="shadow-diagnose-btn" type="button">诊断阴影</button>
+    <button id="shadow-enable-btn" class="primary" type="button" hidden>
+      启用该掩膜并重算选灯
+    </button>
+    <button id="shadow-disable-btn" type="button" hidden>
+      撤销当前掩膜并重算选灯
+    </button>
+  </div>
+  <div id="shadow-status"></div>
+  <div class="shadow-view">
+    <div class="pick-frame shadow-frame">
+      <img id="shadow-img" alt="诊断原照（叠加诊断结果）">
+      <canvas id="shadow-canvas"></canvas>
+    </div>
+    <div>
+      <h3>叠加图例</h3>
+      <ul class="legend">
+        <li><span class="swatch sw-all"></span>所有最优掩膜都判为阴影</li>
+        <li><span class="swatch sw-amb"></span>最优掩膜间判定有分歧</li>
+        <li><span class="swatch sw-conflict"></span>观测冲突（两种假设都不可行）</li>
+      </ul>
+      <p id="shadow-summary" class="hint"></p>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>4. 点选刻线与底面像素对（1～4 对，每对两点不同）</h2>
   <div class="pick-toolbar">
     <button id="start-pair" type="button">＋ 添加点对</button>
     <button id="cancel-pair" type="button" hidden>取消当前点对</button>
@@ -37,7 +81,7 @@
 </section>
 
 <section class="card">
-  <h2>4. 求解与推荐</h2>
+  <h2>5. 求解与推荐</h2>
   <button id="solve-btn" class="primary" type="button">求解灯位</button>
   <span id="stale-note" class="warn" hidden>
     标记或点对已变更，下方为旧结果——正在重新求解…
@@ -52,6 +96,7 @@
 <script>
 const CASE_ID = {{ case_id|tojson }};
 const DEMO = {{ demo|tojson }};
+const DEMO_VARIANT = {{ demo_variant|tojson }};
 const MAX_PAIRS = {{ max_pairs }};
 const SCALE = 32;  // 每个像素放大到 32 CSS 像素
 
@@ -63,6 +108,10 @@ const state = {
   picking: null,
   lastResult: null,
   solving: false,
+  // shadow: 诊断结果与当前启用掩膜（来自后端 /shadow/*）
+  shadow: null,
+  shadowSolving: false,
+  lastShadowPayload: null,  // 启用/撤销时用于重算的点对与可靠标记
 };
 
 const $ = (id) => document.getElementById(id);
@@ -93,9 +142,19 @@ async function init() {
   renderPairs();
   drawMarkers();
 
+  if (DEMO && DEMO.shadow_source !== undefined) {
+    $('shadow-source').value = String(DEMO.shadow_source);
+  }
+
   $('start-pair').addEventListener('click', startPair);
   $('cancel-pair').addEventListener('click', cancelPair);
   canvas.addEventListener('click', onCanvasClick);
+  $('shadow-diagnose-btn').addEventListener('click', diagnoseShadow);
+  $('shadow-enable-btn').addEventListener('click', enableShadow);
+  $('shadow-disable-btn').addEventListener('click', disableShadow);
+  $('shadow-source').addEventListener('change', renderShadowIdle);
+  renderShadowControls();
+  renderShadowIdle();
   $('pair-list').addEventListener('click', (e) => {
     const li = e.target.closest('li[data-idx]');
     if (!li) return;
@@ -131,6 +190,10 @@ async function buildThumbs() {
         </label>
       </figcaption>`;
     wrap.appendChild(figure);
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = `第 ${i + 1} 张`;
+    $('shadow-source').appendChild(opt);
   });
   wrap.addEventListener('change', (e) => {
     const idx = e.target.dataset.img;
@@ -230,6 +293,234 @@ function renderPairs() {
   });
 }
 
+// --------------------------------------------------------------------------
+// 阴影诊断
+// --------------------------------------------------------------------------
+function shadowPayload() {
+  return {
+    pairs: state.pairs.map(p => [p.line, p.base]),
+    reliable: state.reliable,
+  };
+}
+
+function recomputePayload() {
+  // “按已有点对重算”：优先用页面当前点对/标记，没有点时退回上次求解输入。
+  if (state.pairs.length >= 1) return shadowPayload();
+  return state.lastShadowPayload || shadowPayload();
+}
+
+async function diagnoseShadow() {
+  if (state.shadowSolving) return;
+  if (state.lastResult) state.lastShadowPayload = shadowPayload();
+  state.shadowSolving = true;
+  const src = Number($('shadow-source').value);
+  try {
+    const resp = await fetch('/shadow/diagnose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ case_id: CASE_ID, source: src }),
+    });
+    const body = await resp.json();
+    if (!resp.ok || body.error) {
+      renderShadowMessage('error', body.error || ('诊断失败 HTTP ' + resp.status));
+      return;
+    }
+    state.shadow = body.shadow;
+    renderShadowControls();
+    drawShadowOverlay();
+    renderShadowStatus(body.diagnosis, body.shadow);
+  } catch (err) {
+    renderShadowMessage('error', '网络错误: ' + err);
+  } finally {
+    state.shadowSolving = false;
+  }
+}
+
+async function enableShadow() {
+  if (state.shadowSolving) return;
+  state.shadowSolving = true;
+  try {
+    const payload = Object.assign({ case_id: CASE_ID },
+                                  recomputePayload());
+    const resp = await fetch('/shadow/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json();
+    if (!resp.ok || body.error) {
+      // 求解出错：后端已保留原设置与旧推荐，界面不动。
+      renderShadowMessage('error', body.error || ('启用失败 HTTP ' + resp.status));
+      return;
+    }
+    state.shadow = body.shadow;
+    state.lastResult = body.result;
+    $('stale-note').hidden = true;
+    renderShadowControls();
+    drawShadowOverlay();
+    renderShadowStatus(body.shadow.diagnosis, body.shadow);
+    renderResult(body.result);
+  } catch (err) {
+    renderShadowMessage('error', '网络错误: ' + err);
+  } finally {
+    state.shadowSolving = false;
+  }
+}
+
+async function disableShadow() {
+  if (state.shadowSolving) return;
+  state.shadowSolving = true;
+  try {
+    const payload = Object.assign({ case_id: CASE_ID },
+                                  recomputePayload());
+    const resp = await fetch('/shadow/disable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json();
+    if (!resp.ok || body.error) {
+      renderShadowMessage('error', body.error || ('撤销失败 HTTP ' + resp.status));
+      return;
+    }
+    state.shadow = body.shadow;
+    state.lastResult = body.result;
+    $('stale-note').hidden = true;
+    renderShadowControls();
+    renderShadowIdle();
+    renderResult(body.result);
+  } catch (err) {
+    renderShadowMessage('error', '网络错误: ' + err);
+  } finally {
+    state.shadowSolving = false;
+  }
+}
+
+function renderShadowControls() {
+  const active = state.shadow && state.shadow.active;
+  const diag = state.shadow && state.shadow.diagnosis;
+  $('shadow-disable-btn').hidden = !active;
+  // 已启用同一张原照的同一掩膜时不再重复启用；换一张原照须先诊断。
+  $('shadow-enable-btn').hidden = !(
+    diag && !diag.conflict && diag.unique
+    && !(active && active.source === diag.source));
+  $('shadow-source').disabled = false;
+  $('shadow-diagnose-btn').disabled = false;
+  if (diag) {
+    $('shadow-source').value = String(diag.source);
+  } else if (active) {
+    $('shadow-source').value = String(active.source);
+  }
+}
+
+function renderShadowMessage(kind, text) {
+  const cls = kind === 'error' ? 'error-banner'
+    : kind === 'ok' ? 'ok-banner' : 'info-banner';
+  $('shadow-status').innerHTML =
+    `<div class="banner ${cls}">${escapeHtml(text)}</div>`;
+}
+
+function renderShadowStatus(diag, shadow) {
+  if (diag.conflict) {
+    $('shadow-status').innerHTML = `<div class="banner error-banner">
+      <strong>观测冲突。</strong>第 ${diag.source + 1} 张原照有
+      ${diag.conflict_pixels.length} 个像素在“阴影/非阴影”两种假设下都不可行，
+      不存在可行掩膜。请核对照明向量或观察别的原照。</div>`;
+    $('shadow-summary').textContent =
+      `冲突像素：${diag.conflict_pixels.map(p => `(${p[0]},${p[1]})`).join('；')}`;
+    return;
+  }
+  const all = diag.all_shadow.map(p => `(${p[0]},${p[1]})`);
+  const amb = diag.ambiguous.map(p => `(${p[0]},${p[1]})`);
+  let html = `<div class="banner info-banner">
+    第 ${diag.source + 1} 张原照的阴影诊断完成：最短边界 =
+    <strong>${diag.boundary}</strong> 条四邻接边；
+    所有最优掩膜都判为阴影的像素 ${diag.all_shadow.length} 个，
+    判定有分歧的像素 ${diag.ambiguous.length} 个。</div>`;
+  if (!diag.unique) {
+    html += `<div class="banner warn-banner">
+      <strong>最优掩膜不唯一。</strong>存在多种边界同样最短的掩膜
+      （分歧像素见叠加图），按规则不能启用。</div>`;
+  } else {
+    html += `<div class="banner ok-banner">
+      最优掩膜唯一，可以启用；启用后该原照的阴影像素改用单边约束
+      （预测灰度 ≥ 实拍 + ${diag.shadow_margin}），并按当前点对重算选灯。</div>`;
+  }
+  $('shadow-status').innerHTML = html;
+  $('shadow-summary').textContent =
+    `全部最优掩膜判为阴影：${all.length ? all.join('；') : '无'}。`
+    + (amb.length ? ` 有分歧：${amb.join('；')}。` : '');
+  renderShadowActive(shadow);
+}
+
+function renderShadowActive(shadow) {
+  if (!shadow) return;
+  if (shadow.active) {
+    $('shadow-status').insertAdjacentHTML('beforeend', `<div class="banner ok-banner">
+      当前启用：第 ${shadow.active.source + 1} 张原照的阴影掩膜，
+      共 ${shadow.active.count} 个像素。其阴影像素已改用单边约束参与选灯。</div>`);
+  }
+}
+
+function renderShadowIdle() {
+  const active = state.shadow && state.shadow.active;
+  if (active) {
+    renderShadowMessage('ok', `当前启用：第 ${active.source + 1} 张原照的阴影掩膜，
+      共 ${active.count} 个像素。可撤销后重新诊断。`);
+    $('shadow-summary').textContent = '';
+  } else {
+    renderShadowMessage('info', '尚未诊断。选择一张原照后点击“诊断阴影”。');
+    $('shadow-summary').textContent = '';
+  }
+  drawShadowOverlay();
+}
+
+function drawShadowOverlay() {
+  const wrap = $('shadow-img');
+  const diag = state.shadow && state.shadow.diagnosis;
+  const active = state.shadow && state.shadow.active;
+  if (!diag && !active) {
+    wrap.removeAttribute('src');
+    return;
+  }
+  // 有诊断结果时展示被诊断原照；仅有启用状态时展示启用掩膜所在原照。
+  const src = diag ? diag.source : active.source;
+  wrap.src = `/case/${CASE_ID}/image/${src}`;
+  const scale = Math.max(24, Math.floor(320 / state.width));
+  wrap.style.width = (state.width * scale) + 'px';
+  wrap.style.height = (state.height * scale) + 'px';
+  wrap.style.imageRendering = 'pixelated';
+
+  const canvas = $('shadow-canvas');
+  canvas.width = state.width;
+  canvas.height = state.height;
+  canvas.style.width = wrap.style.width;
+  canvas.style.height = wrap.style.height;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (!diag) {
+    active.pixels.forEach(([x, y]) =>
+      fillCell(ctx, x, y, 'rgba(70, 90, 220, 0.62)'));
+    return;
+  }
+  if (diag.conflict) {
+    diag.conflict_pixels.forEach(([x, y]) =>
+      fillCell(ctx, x, y, 'rgba(220, 60, 40, 0.62)'));
+  } else {
+    diag.ambiguous.forEach(([x, y]) =>
+      fillCell(ctx, x, y, 'rgba(240, 170, 40, 0.62)'));
+    diag.all_shadow.forEach(([x, y]) =>
+      fillCell(ctx, x, y, 'rgba(70, 90, 220, 0.62)'));
+  }
+}
+
+function fillCell(ctx, x, y, color) {
+  // canvas 内部分辨率等于裁片像素数，CSS 放大显示；每格即 1 个内部像素。
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, 1, 1);
+}
+
 function markStale() {
   if (state.lastResult) {
     $('stale-note').hidden = false;
@@ -266,7 +557,17 @@ async function solve(manual) {
       return;
     }
     state.lastResult = body.result;
+    state.lastShadowPayload = shadowPayload();
+    if (body.result.shadow) {
+      state.shadow = state.shadow || {};
+      state.shadow.active = body.result.shadow.source === null ? null : {
+        source: body.result.shadow.source,
+        count: body.result.shadow.count,
+        pixels: state.shadow.active ? state.shadow.active.pixels : [],
+      };
+    }
     $('stale-note').hidden = true;
+    renderShadowControls();
     renderResult(body.result);
   } catch (err) {
     renderError('网络错误: ' + err);
@@ -294,9 +595,16 @@ function renderResult(r) {
     return;
   }
 
-  html += `<div class="banner info-banner">
+    html += `<div class="banner info-banner">
     可行解释（${r.feasible_exclusions.length} 种）：
     ${r.feasible_exclusions.map(escapeHtml).join('；')}</div>`;
+
+  if (r.shadow && r.shadow.source !== null) {
+    html += `<div class="banner info-banner">
+      本次求解已启用第 ${r.shadow.source + 1} 张原照的阴影掩膜
+      （${r.shadow.count} 个像素改用单边约束：预测灰度 ≥ 实拍 + ${r.shadow.margin}）。
+    </div>`;
+  }
 
   // 推荐横幅（合格且保证值为正，同分按输入顺序取首盏）
   if (r.recommendation === null || r.guarantee === null) {

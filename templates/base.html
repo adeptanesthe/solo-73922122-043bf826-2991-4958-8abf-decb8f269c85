@@ -10,14 +10,17 @@
 <header>
   <h1>石刻浅刻线 · 补拍灯位选择</h1>
   <nav><a href="{{ url_for('index') }}">新建案例</a>
-       <a href="{{ url_for('demo') }}">载入演示数据</a></nav>
+       <a href="{{ url_for('demo') }}">载入演示数据</a>
+       <a href="{{ url_for('demo', scene='shadow') }}">阴影诊断演示</a></nav>
 </header>
 <main>
 {% block content %}{% endblock %}
 </main>
 <footer>
   约束：反射向量 z≥0；|照明向量·反射向量 − 实拍灰度| ≤ 2；
-  备选灯全区预测灰度须落在 [5, 250]。Pillow 读图 · SciPy/HiGHS 求解。
+  阴影像素对被诊断原照改用 照明向量·反射向量 ≥ 实拍灰度 + 3；
+  备选灯全区预测灰度须落在 [5, 250]。Pillow 读图 · SciPy/HiGHS 求解 ·
+  阴影掩膜用一次最小割求最短边界。
 </footer>
 {% block scripts %}{% endblock %}
 </body>

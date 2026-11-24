@@ -8,7 +8,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from solver import GRAY_TOL, Scene, evaluate  # noqa: E402
+from solver import (GRAY_TOL, SHADOW_MARGIN, Scene, diagnose_shadow,
+                    evaluate)  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEMO = os.path.join(ROOT, "demo")
@@ -145,6 +146,159 @@ def test_pair_difference_must_be_positive():
     check(result["recommendation"] != 1, "负保证灯未被推荐")
 
 
+def load_shadow_demo():
+    with open(os.path.join(DEMO, "meta.json"), encoding="utf-8") as fh:
+        meta = json.load(fh)["shadow_demo"]
+    images = np.stack([
+        np.asarray(Image.open(os.path.join(DEMO, name)).convert("L"),
+                   dtype=np.uint8)
+        for name in meta["images"]
+    ])
+    return images, np.asarray(meta["lights"], dtype=np.float64), meta
+
+
+def test_shadow_diagnosis():
+    print("test_shadow_diagnosis")
+    images, lights, meta = load_shadow_demo()
+    diag = diagnose_shadow(images, lights, 0)
+    check(not diag["conflict"], "阴影诊断无观测冲突")
+    check(diag["boundary"] == 4,
+          f"左上 2x2 与其余像素之间边界为 4 条边，实际 {diag['boundary']}")
+    check(sorted(diag["all_shadow"]) == [(0, 0), (0, 1), (1, 0), (1, 1)],
+          f"所有最优掩膜都判为阴影的像素是左上 2x2，实际 {diag['all_shadow']}")
+    check(diag["ambiguous"] == [], "没有判定有分歧的像素")
+    check(diag["unique"], "唯一最优掩膜")
+    check(SHADOW_MARGIN == 3.0, "阴影像素单边裕量为 3")
+
+    # 未启用掩膜：原照无共同解释
+    pairs = [(tuple(p[0]), tuple(p[1])) for p in meta["suggested_pairs"]]
+    plain = Scene(images=images, lights=lights,
+                  candidates=np.asarray(meta["candidates"]),
+                  pairs=pairs, reliable=[True] * 4)
+    check(evaluate(plain)["infeasible"], "未启用掩膜时原照无共同解释")
+
+    # 启用掩膜：按单边约束重算，并给出推荐
+    masked = Scene(images=images, lights=lights,
+                   candidates=np.asarray(meta["candidates"]),
+                   pairs=pairs, reliable=[True] * 4,
+                   shadow_source=0,
+                   shadow_pixels=frozenset(diag["all_shadow"]))
+    result = evaluate(masked)
+    check(not result["infeasible"], "启用掩膜后存在共同解释")
+    check(result["feasible_exclusions"] == [None],
+          "启用掩膜且全部可靠时唯一解释为不排除")
+    check(result["recommendation"] == 0,
+          f"启用掩膜后推荐第 1 盏，实际 {result['recommendation']}")
+    check(result["guarantee"] is not None and result["guarantee"] > 0,
+          f"推荐保证值为正 ({result['guarantee']})")
+
+    # 只把部分阴影像素改成单边约束会破坏可行域，说明单边约束确实生效
+    partial = Scene(images=images, lights=lights,
+                    candidates=np.asarray(meta["candidates"]),
+                    pairs=pairs, reliable=[True] * 4,
+                    shadow_source=0,
+                    shadow_pixels=frozenset({(0, 0), (0, 1)}) - {(0, 1)})
+    partial_result = evaluate(partial)
+    check(partial_result["infeasible"], "掩膜缺一角时观测互相冲突")
+
+
+def test_shadow_conflict_and_ambiguity():
+    print("test_shadow_conflict_and_ambiguity")
+    images, lights, _ = load_shadow_demo()
+
+    # 冲突：把第 1 张原照整张 +40，任何标签都无法同时满足全组观测。
+    broken = images.copy()
+    broken[0] = np.clip(broken[0].astype(int) + 40, 0, 255).astype(np.uint8)
+    diag = diagnose_shadow(broken, lights, 0)
+    check(diag["conflict"], "整张偏亮导致观测冲突")
+    check(diag["conflict_pixels"], "冲突像素非空")
+    check(diag["mask"] is None and not diag["unique"],
+          "观测冲突时没有可行掩膜")
+
+    # 歧义：只有一个原照时，每个像素在“阴影/非阴影”下都可行，
+    # 空掩膜与全阴影掩膜的边界同为 0，没有任何像素被所有最优掩膜判为阴影。
+    one_image = np.full((1, 3, 3), 100, dtype=np.uint8)
+    one_light = np.array([[0.2, 0.1, 0.9]])
+    diag2 = diagnose_shadow(one_image, one_light, 0)
+    check(not diag2["conflict"], "单原照不存在观测冲突")
+    check(diag2["boundary"] == 0, "全自由像素时最短边界为 0")
+    check(len(diag2["ambiguous"]) == 9 and diag2["all_shadow"] == [],
+          "全部像素都判定有分歧")
+    check(not diag2["unique"], "最优掩膜不唯一，不能启用")
+
+    # 注入强制标签直接验证最小割：同一行两端强制阴影、下方强制非阴影，
+    # 中间的自由像素既可连成一整条阴影带，也可只留两端，边界同为 4。
+    from solver import _min_boundary_labels
+    kinds = [2] * 16
+    kinds[0] = 1        # (0,0) 强制阴影
+    kinds[3] = 1        # (3,0) 强制阴影
+    for x in range(4):  # 第二行强制非阴影
+        kinds[4 + x] = 0
+    boundary, all_shadow, ambiguous = _min_boundary_labels(kinds, 4, 4)
+    check(boundary == 4, f"最短边界为 4，实际 {boundary}")
+    check(sorted(all_shadow) == [(0, 0), (3, 0)],
+          f"两端是所有最优掩膜的共同阴影，实际 {all_shadow}")
+    check(sorted(ambiguous) == [(1, 0), (2, 0)],
+          f"顶行中间像素判定有分歧，实际 {ambiguous}")
+
+    # 一整块强制阴影、其余全部强制非阴影：边界最短且唯一。
+    kinds2 = [0] * 16
+    for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+        kinds2[y * 4 + x] = 1
+    boundary2, all2, amb2 = _min_boundary_labels(kinds2, 4, 4)
+    check(boundary2 == 4 and not amb2,
+          f"左上 2x2 强制阴影、其余强制非阴影时边界 4、无分歧，"
+          f"实际 boundary={boundary2} amb={amb2}")
+
+
+def test_shadow_mask_scope():
+    print("test_shadow_mask_scope")
+    images, lights, meta = load_shadow_demo()
+    pairs = [((2, 1), (4, 4))]
+    # 掩膜只对该原照生效：标为其他原照时并不改善可行性。
+    wrong = Scene(images=images, lights=lights,
+                  candidates=np.asarray(meta["candidates"]),
+                  pairs=pairs, reliable=[True] * 4,
+                  shadow_source=3,
+                  shadow_pixels=frozenset({(0, 0), (0, 1), (1, 0), (1, 1)}))
+    check(evaluate(wrong)["infeasible"], "掩膜只作用于所选原照，标错原照仍不可行")
+
+    # 启用掩膜不改变“排除整张原照”的原有规则：第 1 张仍可被排除。
+    masked = Scene(images=images, lights=lights,
+                   candidates=np.asarray(meta["candidates"]),
+                   pairs=pairs, reliable=[False, True, True, True],
+                   shadow_source=0,
+                   shadow_pixels=frozenset({(0, 0), (0, 1), (1, 0), (1, 1)}))
+    result = evaluate(masked)
+    check(0 in result["feasible_exclusions"],
+          f"启用掩膜后仍允许按原规则排除整张原照，实际 {result['feasible_exclusions']}")
+
+
+def test_shadow_diagnosis_max_crop():
+    print("test_shadow_diagnosis_max_crop")
+    # 覆盖允许的最大裁片尺寸 16x16：最短边界与掩膜仍由一次最小割给出。
+    rng = np.random.default_rng(4)
+    k, h, w = 8, 16, 16
+    lights = np.column_stack([rng.uniform(-0.5, 0.5, (k, 2)),
+                              rng.uniform(0.6, 1.0, k)])
+    grid = np.zeros((h, w, 3))
+    grid[:, :, 2] = 200.0
+    for (x, y) in [(3, 3), (4, 3), (7, 8), (8, 8), (11, 5)]:
+        grid[y, x] = [100.0, 0.0, 150.0]
+    raw = np.rint(grid @ lights.T).astype(int)
+    dark = {(x, y) for x in range(5) for y in range(4)}
+    for (x, y) in dark:
+        raw[y, x, 0] -= 6
+    images = np.clip(raw, 0, 255).astype(np.uint8).transpose(2, 0, 1)
+    diag = diagnose_shadow(images, lights, 0)
+    check(not diag["conflict"], "16x16 诊断无冲突")
+    check(diag["unique"], "16x16 最优掩膜唯一")
+    check(set(diag["all_shadow"]) == dark,
+          f"16x16 掩膜精确覆盖被压暗的 5x4 区域，实际 {len(diag['all_shadow'])} 像素")
+    # 边界 = 5x4 区域外露的边数：右侧 4 + 下侧 5 = 9
+    check(diag["boundary"] == 9, f"16x16 最短边界 9，实际 {diag['boundary']}")
+
+
 if __name__ == "__main__":
     test_demo_recommendation()
     test_tolerance_band()
@@ -152,4 +306,8 @@ if __name__ == "__main__":
     test_z_nonnegative_enforced()
     test_tie_prefers_first()
     test_pair_difference_must_be_positive()
+    test_shadow_diagnosis()
+    test_shadow_conflict_and_ambiguity()
+    test_shadow_mask_scope()
+    test_shadow_diagnosis_max_crop()
     print("\n全部自测通过。")

@@ -6,14 +6,17 @@ const path = require('path');
 const { JSDOM } = require('/tmp/pw/node_modules/jsdom');
 
 const BASE = 'http://127.0.0.1:8000';
+// 默认演示夹具用于既有场景；阴影演示夹具用于诊断/启用交互。
 const html = fs.readFileSync(path.join(__dirname, 'dom_fixture.html'), 'utf8');
+const shadowHtml = fs.readFileSync(
+  path.join(__dirname, 'dom_fixture_shadow.html'), 'utf8');
 
 const tick = (ms = 30) => new Promise(r => setTimeout(r, ms));
 
-function makeDom(handler) {
+function makeDom(handler, source = html) {
   // 页面初始化期间就会发起 fetch，处理器经 beforeParse 提前挂好。
   const holder = { handler };
-  const dom = new JSDOM(html, {
+  const dom = new JSDOM(source, {
     runScripts: 'dangerously',
     pretendToBeVisual: true,
     url: BASE + '/demo',
@@ -21,7 +24,7 @@ function makeDom(handler) {
       // jsdom 不实现 canvas 2d 上下文与图像解码。
       window.HTMLCanvasElement.prototype.getContext = () => ({
         clearRect() {}, setTransform() {}, scale() {}, beginPath() {},
-        arc() {}, fill() {}, fillText() {},
+        arc() {}, fill() {}, fillText() {}, fillRect() {},
       });
       // 桩接图像：decode 立即兑现，自然尺寸固定为演示裁片的 4x4
       window.HTMLImageElement.prototype.decode = function () {
@@ -185,6 +188,182 @@ async function run() {
         '演示两对 + 新点选一对 = 3 对（上限 4）');
   check(w4.document.getElementById('start-pair').hidden === false,
         '成对点选完成后恢复添加按钮');
+
+  // ---- 阴影诊断与启用（使用阴影演示夹具）----
+  const shadowDiag = {
+    ok: true,
+    diagnosis: {
+      source: 0, conflict: false, conflict_pixels: [],
+      unique: true, boundary: 4, shadow_margin: 3,
+      all_shadow: [[0, 0], [1, 0], [0, 1], [1, 1]], ambiguous: [],
+    },
+    shadow: {
+      active: null,
+      diagnosis: {
+        source: 0, conflict: false, conflict_pixels: [],
+        unique: true, boundary: 4, shadow_margin: 3,
+        all_shadow: [[0, 0], [1, 0], [0, 1], [1, 1]], ambiguous: [],
+      },
+    },
+  };
+  const shadowSolveResult = {
+    ok: true,
+    result: Object.assign({}, okResult.result, {
+      recommendation: 0, guarantee: 43.8063,
+      shadow: { source: 0, count: 4, margin: 3 },
+    }),
+    shadow: {
+      active: { source: 0, count: 4, pixels: [[0, 0], [0, 1], [1, 0], [1, 1]] },
+      diagnosis: shadowDiag.diagnosis,
+    },
+  };
+  const shadowCalls = [];
+  const d5 = makeDom((url, opts) => {
+    if (url.includes('/image/')) {
+      return Promise.resolve(jsonResponse({},
+        Number(url.split('/image/')[1]) < 4 ? 200 : 404));
+    }
+    const body = opts ? JSON.parse(opts.body) : null;
+    shadowCalls.push({ url, body });
+    if (url.includes('/shadow/diagnose')) {
+      return Promise.resolve(jsonResponse(shadowDiag));
+    }
+    if (url.includes('/shadow/disable')) {
+      return Promise.resolve(jsonResponse({
+        ok: true,
+        result: Object.assign({}, okResult.result, {
+          shadow: { source: null, count: 0, margin: 3 },
+        }),
+        shadow: { active: null, diagnosis: shadowDiag.diagnosis },
+      }));
+    }
+    if (url.includes('/shadow/enable')) {
+      return Promise.resolve(jsonResponse(shadowSolveResult));
+    }
+    return Promise.resolve(jsonResponse(okResult));
+  }, shadowHtml);
+  await tick();
+  const w5 = d5.dom.window;
+  const doc5 = w5.document;
+
+  check(doc5.getElementById('shadow-source').options.length === 4,
+        '阴影诊断可选择 4 张原照');
+  check(doc5.getElementById('shadow-source').value === '0',
+        '阴影演示默认选中第 1 张');
+  check(doc5.getElementById('shadow-enable-btn').hidden === true,
+        '诊断前不显示启用按钮');
+
+  doc5.getElementById('shadow-diagnose-btn').click();
+  await tick();
+  const diagCall = shadowCalls.find(c => c.url.includes('/shadow/diagnose'));
+  check(diagCall && diagCall.body.source === 0, '诊断请求带上所选原照索引');
+  const shadowText = doc5.getElementById('shadow-status').textContent;
+  check(shadowText.includes('最短边界') && shadowText.includes('4'),
+        '诊断后显示最短边界');
+  check(shadowText.includes('唯一'), '诊断后说明最优掩膜唯一');
+  check(doc5.getElementById('shadow-enable-btn').hidden === false,
+        '唯一掩膜时显示启用按钮');
+  check(doc5.getElementById('shadow-summary').textContent.includes('(0,0)'),
+        '摘要列出所有最优掩膜都判为阴影的像素');
+
+  doc5.getElementById('shadow-enable-btn').click();
+  await tick();
+  const enableCall = shadowCalls.find(c => c.url.includes('/shadow/enable'));
+  check(enableCall && enableCall.body.case_id,
+        '启用请求带上当前案例');
+  check(enableCall.body.pairs && enableCall.body.pairs.length === 1,
+        '启用请求带上当前点对');
+  check(enableCall.body.reliable[0] === true, '启用请求带上可靠标记');
+  const resultText = doc5.getElementById('result').textContent;
+  check(resultText.includes('推荐：第 1 盏'), '启用后渲染推荐');
+  check(doc5.getElementById('shadow-status').textContent.includes('当前启用'),
+        '启用后显示当前启用状态');
+  check(doc5.getElementById('shadow-disable-btn').hidden === false,
+        '启用后显示撤销按钮');
+  check(doc5.getElementById('shadow-enable-btn').hidden === true,
+        '已启用同一掩膜时不再显示启用按钮');
+
+  doc5.getElementById('shadow-disable-btn').click();
+  await tick();
+  check(shadowCalls.some(c => c.url.includes('/shadow/disable')),
+        '撤销调用后端');
+  check(doc5.getElementById('shadow-disable-btn').hidden === true,
+        '撤销后隐藏撤销按钮');
+
+  // 有分歧的最优掩膜：不得提供启用按钮
+  const ambiguousDiag = {
+    ok: true,
+    diagnosis: {
+      source: 0, conflict: false, conflict_pixels: [],
+      unique: false, boundary: 4, shadow_margin: 3,
+      all_shadow: [[0, 0]], ambiguous: [[1, 0], [2, 0]],
+    },
+    shadow: {
+      active: null,
+      diagnosis: {
+        source: 0, conflict: false, conflict_pixels: [],
+        unique: false, boundary: 4, shadow_margin: 3,
+        all_shadow: [[0, 0]], ambiguous: [[1, 0], [2, 0]],
+      },
+    },
+  };
+  const d6 = makeDom((url) => {
+    if (url.includes('/image/')) {
+      return Promise.resolve(jsonResponse({},
+        Number(url.split('/image/')[1]) < 4 ? 200 : 404));
+    }
+    if (url.includes('/shadow/diagnose')) {
+      return Promise.resolve(jsonResponse(ambiguousDiag));
+    }
+    return Promise.resolve(jsonResponse(okResult));
+  }, shadowHtml);
+  await tick();
+  const w6 = d6.dom.window;
+  w6.document.getElementById('shadow-diagnose-btn').click();
+  await tick();
+  check(w6.document.getElementById('shadow-enable-btn').hidden === true,
+        '最优掩膜不唯一时不显示启用按钮');
+  check(w6.document.getElementById('shadow-status').textContent.includes('不唯一'),
+        '显示最优掩膜不唯一提示');
+  check(w6.document.getElementById('shadow-status').textContent.includes('分歧'),
+        '显示有分歧的像素数');
+
+  // 观测冲突：提示冲突像素，不给启用按钮
+  const conflictDiag = {
+    ok: true,
+    diagnosis: {
+      source: 0, conflict: true, conflict_pixels: [[2, 0], [3, 0]],
+      unique: false, boundary: null, shadow_margin: 3,
+      all_shadow: [], ambiguous: [],
+    },
+    shadow: {
+      active: null,
+      diagnosis: {
+        source: 0, conflict: true, conflict_pixels: [[2, 0], [3, 0]],
+        unique: false, boundary: null, shadow_margin: 3,
+        all_shadow: [], ambiguous: [],
+      },
+    },
+  };
+  const d7 = makeDom((url) => {
+    if (url.includes('/image/')) {
+      return Promise.resolve(jsonResponse({},
+        Number(url.split('/image/')[1]) < 4 ? 200 : 404));
+    }
+    if (url.includes('/shadow/diagnose')) {
+      return Promise.resolve(jsonResponse(conflictDiag));
+    }
+    return Promise.resolve(jsonResponse(okResult));
+  }, shadowHtml);
+  await tick();
+  const w7 = d7.dom.window;
+  w7.document.getElementById('shadow-diagnose-btn').click();
+  await tick();
+  const conflictText = w7.document.getElementById('shadow-status').textContent;
+  check(conflictText.includes('观测冲突'), '观测冲突时显示提示');
+  check(conflictText.includes('2 个像素'), '说明冲突像素数量');
+  check(w7.document.getElementById('shadow-enable-btn').hidden === true,
+        '观测冲突时不显示启用按钮');
 
   console.log(asserts.join('\n'));
   console.log('\nDOM 交互自测全部通过。');

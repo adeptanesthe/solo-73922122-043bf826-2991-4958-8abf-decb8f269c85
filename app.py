@@ -21,7 +21,8 @@ from flask import (Flask, jsonify, render_template, request,
                    send_file, session)
 from PIL import Image
 
-from solver import GRAY_HIGH, GRAY_LOW, GRAY_TOL, Scene, evaluate
+from solver import (GRAY_HIGH, GRAY_LOW, GRAY_TOL, SHADOW_MARGIN, Scene,
+                    diagnose_shadow, evaluate)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -165,6 +166,9 @@ def upload():
         "candidates": np.asarray(candidates, dtype=np.float64),
         "created": time.time(),
         "last_result": None,
+        # 阴影诊断结果与当前启用的掩膜（每案例至多一个）
+        "shadow_diagnosis": None,
+        "shadow_mask": None,
     }
     session["case_id"] = case_id
     return jsonify({"case_id": case_id, "width": width, "height": height,
@@ -175,12 +179,18 @@ def upload():
 @app.route("/demo")
 def demo():
     """载入随仓库附带的演示裁片，进入同一套点选/求解界面。"""
+    variant = "shadow" if request.args.get("scene") == "shadow" else "default"
     meta_path = os.path.join(app.root_path, "demo", "meta.json")
     with open(meta_path, encoding="utf-8") as fh:
         meta = json.load(fh)
 
+    if variant == "shadow":
+        scene_meta = meta["shadow_demo"]
+    else:
+        scene_meta = meta
+
     arrays, pngs = [], []
-    for name in meta["images"]:
+    for name in scene_meta["images"]:
         path = os.path.join(app.root_path, "demo", name)
         with open(path, "rb") as fh:
             data = fh.read()
@@ -193,16 +203,20 @@ def demo():
     CASES[case_id] = {
         "images": np.stack(arrays),
         "pngs": pngs,
-        "size": tuple(meta["size"]),
-        "lights": np.asarray(meta["lights"], dtype=np.float64),
-        "candidates": np.asarray(meta["candidates"], dtype=np.float64),
+        "size": tuple(scene_meta["size"]),
+        "lights": np.asarray(scene_meta["lights"], dtype=np.float64),
+        "candidates": np.asarray(scene_meta["candidates"], dtype=np.float64),
         "created": time.time(),
         "last_result": None,
-        "demo_meta": meta,
+        "demo_meta": scene_meta,
+        "demo_variant": variant,
+        "shadow_diagnosis": None,
+        "shadow_mask": None,
     }
     session["case_id"] = case_id
     return render_template("case.html", case_id=case_id,
-                           demo=meta, max_pairs=MAX_PAIRS)
+                           demo=scene_meta, demo_variant=variant,
+                           max_pairs=MAX_PAIRS)
 
 
 @app.route("/case/<case_id>/image/<int:index>")
@@ -219,7 +233,7 @@ def case_view(case_id):
     if case is None:
         return render_template("case.html", case_id=None), 404
     return render_template("case.html", case_id=case_id, demo=None,
-                           max_pairs=MAX_PAIRS)
+                           demo_variant="default", max_pairs=MAX_PAIRS)
 
 
 @app.route("/solve", methods=["POST"])
@@ -235,23 +249,10 @@ def solve():
     width, height = case["size"]
     k = case["images"].shape[0]
     pairs = _validate_pairs(payload.get("pairs"), width, height)
+    reliable = _validate_reliable(payload.get("reliable"), k)
 
-    reliable = payload.get("reliable")
-    if (not isinstance(reliable, list) or len(reliable) != k
-            or not all(isinstance(v, bool) for v in reliable)):
-        raise ValidationError("可靠标记格式非法")
-    if not any(reliable):
-        raise ValidationError("至少保留一张可靠原照")
-
-    scene = Scene(
-        images=case["images"],
-        lights=case["lights"],
-        candidates=case["candidates"],
-        pairs=pairs,
-        reliable=reliable,
-    )
     try:
-        result = evaluate(scene)
+        result = _run_evaluation(case, pairs, reliable)
     except RuntimeError as exc:
         return jsonify({"ok": False, "error": f"求解器错误: {exc}"}), 500
 
@@ -260,6 +261,181 @@ def solve():
                            "result": result}
 
     return jsonify({"ok": True, "result": _serialize_result(result, case)})
+
+
+def _validate_reliable(reliable, k):
+    if (not isinstance(reliable, list) or len(reliable) != k
+            or not all(isinstance(v, bool) for v in reliable)):
+        raise ValidationError("可靠标记格式非法")
+    if not any(reliable):
+        raise ValidationError("至少保留一张可靠原照")
+    return reliable
+
+
+def _active_mask(case):
+    """当前启用的阴影掩膜 (source, frozenset) 或 None。"""
+    mask = case.get("shadow_mask")
+    if not mask:
+        return None
+    return mask["source"], frozenset(mask["pixels"])
+
+
+def _run_evaluation(case, pairs, reliable):
+    active = _active_mask(case)
+    scene = Scene(
+        images=case["images"],
+        lights=case["lights"],
+        candidates=case["candidates"],
+        pairs=pairs,
+        reliable=reliable,
+        shadow_source=active[0] if active else None,
+        shadow_pixels=active[1] if active else None,
+    )
+    return evaluate(scene)
+
+
+# --------------------------------------------------------------------------
+# 阴影诊断：同一案例至多启用一张掩膜
+# --------------------------------------------------------------------------
+def _shadow_state(case):
+    active = case.get("shadow_mask")
+    diag = case.get("shadow_diagnosis")
+    return {
+        "active": None if active is None else {
+            "source": active["source"],
+            "pixels": [list(p) for p in sorted(active["pixels"])],
+            "count": len(active["pixels"]),
+        },
+        "diagnosis": None if diag is None else _serialize_diagnosis(diag),
+    }
+
+
+def _serialize_diagnosis(diag):
+    return {
+        "source": diag["source"],
+        "conflict": diag["conflict"],
+        "conflict_pixels": [list(p) for p in diag["conflict_pixels"]],
+        "unique": diag["unique"],
+        "boundary": diag["boundary"],
+        "all_shadow": [list(p) for p in sorted(diag["all_shadow"])],
+        "ambiguous": [list(p) for p in sorted(diag["ambiguous"])],
+        "shadow_margin": SHADOW_MARGIN,
+    }
+
+
+@app.route("/shadow/diagnose", methods=["POST"])
+def shadow_diagnose():
+    """对选定原照做阴影诊断，返回最优掩膜与分歧像素。"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ValidationError("请求体必须是 JSON")
+    case = CASES.get(payload.get("case_id"))
+    if case is None:
+        raise ValidationError("案例不存在或已过期，请重新上传")
+
+    source = payload.get("source")
+    k = case["images"].shape[0]
+    if (not isinstance(source, int) or isinstance(source, bool)
+            or not (0 <= source < k)):
+        raise ValidationError("阴影诊断的原照索引非法")
+
+    try:
+        diag = diagnose_shadow(case["images"], case["lights"], source)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": f"求解器错误: {exc}"}), 500
+
+    case["shadow_diagnosis"] = diag
+    return jsonify({"ok": True, "diagnosis": _serialize_diagnosis(diag),
+                    "shadow": _shadow_state(case)})
+
+
+@app.route("/shadow/enable", methods=["POST"])
+def shadow_enable():
+    """启用唯一最优掩膜；按当前点对重算，失败则保留旧设置与推荐。"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ValidationError("请求体必须是 JSON")
+    case = CASES.get(payload.get("case_id"))
+    if case is None:
+        raise ValidationError("案例不存在或已过期，请重新上传")
+
+    diag = case.get("shadow_diagnosis")
+    if diag is None:
+        raise ValidationError("请先对一张原照做阴影诊断")
+    if diag["conflict"]:
+        raise ValidationError("该原照观测冲突，没有可行掩膜")
+    if not diag["unique"]:
+        raise ValidationError("最优掩膜不唯一，不能启用")
+
+    source = diag["source"]
+    if (isinstance(payload.get("source"), int)
+            and payload["source"] != source):
+        raise ValidationError("诊断结果与所选原照不一致，请重新诊断")
+
+    width, height = case["size"]
+    pairs, reliable = _pairs_reliable_for_recompute(case, payload,
+                                                    width, height)
+    mask = {"source": source, "pixels": [tuple(p) for p in diag["all_shadow"]]}
+
+    old_mask = case.get("shadow_mask")
+    case["shadow_mask"] = mask
+    try:
+        result = _run_evaluation(case, pairs, reliable)
+    except RuntimeError as exc:
+        # 求解出错：恢复旧设置与旧推荐。
+        case["shadow_mask"] = old_mask
+        return jsonify({"ok": False,
+                        "error": f"求解器错误: {exc}，已保留原设置"}), 500
+
+    case["last_result"] = {"pairs": pairs, "reliable": reliable,
+                           "result": result}
+    return jsonify({"ok": True, "result": _serialize_result(result, case),
+                    "shadow": _shadow_state(case)})
+
+
+@app.route("/shadow/disable", methods=["POST"])
+def shadow_disable():
+    """撤销当前掩膜；按当前点对重算，失败则保留旧设置与推荐。"""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ValidationError("请求体必须是 JSON")
+    case = CASES.get(payload.get("case_id"))
+    if case is None:
+        raise ValidationError("案例不存在或已过期，请重新上传")
+
+    width, height = case["size"]
+    pairs, reliable = _pairs_reliable_for_recompute(case, payload,
+                                                    width, height)
+
+    old_mask = case.get("shadow_mask")
+    case["shadow_mask"] = None
+    try:
+        result = _run_evaluation(case, pairs, reliable)
+    except RuntimeError as exc:
+        case["shadow_mask"] = old_mask
+        return jsonify({"ok": False,
+                        "error": f"求解器错误: {exc}，已保留原设置"}), 500
+
+    case["last_result"] = {"pairs": pairs, "reliable": reliable,
+                           "result": result}
+    return jsonify({"ok": True, "result": _serialize_result(result, case),
+                    "shadow": _shadow_state(case)})
+
+
+def _pairs_reliable_for_recompute(case, payload, width, height):
+    """优先使用请求中的当前点对/可靠标记，缺省沿用上次求解输入。"""
+    last = case.get("last_result") or {}
+    pairs_raw = payload.get("pairs")
+    if pairs_raw is None and last.get("pairs") is not None:
+        # 上次求解存的是清洗后的元组，转回 JSON 形态再走同一套校验。
+        pairs_raw = [[list(p[0]), list(p[1])] for p in last["pairs"]]
+    reliable_raw = payload.get("reliable", last.get("reliable"))
+    if pairs_raw is None or reliable_raw is None:
+        raise ValidationError("请先完成一次求解，或随请求提交点对与可靠标记")
+    pairs = _validate_pairs(pairs_raw, width, height)
+    reliable = _validate_reliable(reliable_raw,
+                                  case["images"].shape[0])
+    return pairs, reliable
 
 
 def _int_field(raw, label):
@@ -298,6 +474,13 @@ def _serialize_result(result, case):
                       else round(result["guarantee"], 4)),
         "gray_band": [GRAY_LOW, GRAY_HIGH],
         "gray_tol": GRAY_TOL,
+        "shadow": {
+            "source": (None if not case.get("shadow_mask")
+                       else case["shadow_mask"]["source"]),
+            "count": (0 if not case.get("shadow_mask")
+                      else len(case["shadow_mask"]["pixels"])),
+            "margin": SHADOW_MARGIN,
+        },
     }
 
 

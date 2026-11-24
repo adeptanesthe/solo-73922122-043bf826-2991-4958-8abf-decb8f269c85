@@ -120,3 +120,38 @@ button.primary:hover { background: #835822; }
 }
 .verdict-table th { background: #efe8da; }
 .rec-row { background: #fdf6e3; font-weight: 600; }
+.shadow-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.shadow-controls select {
+  padding: 6px 8px;
+  border: 1px solid #c9bfae;
+  border-radius: 6px;
+  font-size: 14px;
+}
+.shadow-view {
+  display: flex;
+  gap: 28px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  margin-top: 12px;
+}
+.shadow-frame { min-width: 160px; min-height: 160px; }
+#shadow-canvas { position: absolute; left: 0; top: 0; }
+#shadow-img { display: block; image-rendering: pixelated; }
+.legend { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+.legend li { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.swatch {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, .2);
+}
+.sw-all { background: rgba(70, 90, 220, .62); }
+.sw-amb { background: rgba(240, 170, 40, .62); }
+.sw-conflict { background: rgba(220, 60, 40, .62); }

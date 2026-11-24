@@ -16,6 +16,19 @@
 
 合格灯的保证值：所有可行解释、所有点对中，底面像素与刻线像素预测灰度
 之差（底面减刻线）的最小值。
+
+阴影诊断
+--------
+支架投影可能只压暗某张原照的一角。对选定的原照 s 与像素 p，给每个像素
+二选一的标签：
+
+* 非阴影：沿用全部原照的 |L_i . r - g_i| <= 2；
+* 阴影：原照 s 改用单边约束 L_s . r >= g_s + 3，其余原照仍用 ±2。
+
+若某个像素两种标签都不可行，则观测冲突。否则在所有使“阴影/非阴影”四邻接
+边界边数最小的可行标签中，用一次 s-t 最小割求出全部最优掩膜的公共阴影集
+（最小源侧）与判定有分歧的像素集（最小源侧与最大源侧的差集）。最小割与
+最大流等价，因此无需枚举掩膜。
 """
 from __future__ import annotations
 
@@ -23,9 +36,12 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import linprog
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import maximum_flow
 
 # ---- 业务常量 -----------------------------------------------------------
 GRAY_TOL = 2.0      # 实拍灰度与点积的最大偏差
+SHADOW_MARGIN = 3.0  # 阴影像素的单边裕量：预测灰度至少比实拍高 3
 GRAY_LOW = 5.0      # 备选灯预测灰度下界
 GRAY_HIGH = 250.0   # 备选灯预测灰度上界
 BOUND_EPS = 1e-6    # 边界判定的数值容差
@@ -39,11 +55,15 @@ class Scene:
     # candidates: shape (m, 3) 的备选灯向量
     # pairs:      [((line_x, line_y), (base_x, base_y)), ...]
     # reliable:   长度 k 的布尔列表，True 表示该照片可靠、不得排除
+    # shadow_source: 已启用的阴影诊断原照索引；None 表示未启用掩膜
+    # shadow_pixels: 启用掩膜时被判为阴影的像素集合 {(x, y), ...}
     images: np.ndarray
     lights: np.ndarray
     candidates: np.ndarray
     pairs: list
     reliable: list
+    shadow_source: int | None = None
+    shadow_pixels: frozenset | None = None
 
 
 class _LPSolver:
@@ -56,6 +76,23 @@ class _LPSolver:
         self._poly_cache: dict = {}
         self._feas_cache: dict = {}
         self._ext_cache: dict = {}
+        self._shadow = self._shadow_lookup()
+
+    def _shadow_lookup(self):
+        """返回像素 -> 是否使用原照 s 的单边阴影像素约束。"""
+        scene = self.scene
+        if scene.shadow_source is None or scene.shadow_pixels is None:
+            return lambda pixel: False
+        if not (0 <= scene.shadow_source < self.k):
+            # 索引非法时不应用任何阴影约束，避免静默作用到别的原照上。
+            return lambda pixel: False
+        cells = scene.shadow_pixels
+
+        def is_shadow(pixel: int) -> bool:
+            y, x = divmod(pixel, self.w)
+            return (x, y) in cells
+
+        return is_shadow
 
     def _polyhedron(self, pixel: int, exclude):
         """像素 pixel 在排除选择 exclude 下的半空间集合 A r <= b。"""
@@ -65,12 +102,18 @@ class _LPSolver:
             return cached
 
         y, x = divmod(pixel, self.w)
+        shadow = self._shadow(pixel)
         rows_a, rows_b = [], []
         for i in range(self.k):
             if i == exclude:
                 continue
             light = self.scene.lights[i]
             g = self.grays[i, y, x]
+            if shadow and i == self.scene.shadow_source:
+                # 阴影像素：L.r >= g + 3  ->  -L.r <= -(g + 3)
+                rows_a.append(-light)
+                rows_b.append(-(g + SHADOW_MARGIN))
+                continue
             # L.r <= g + 2
             rows_a.append(light)
             rows_b.append(g + GRAY_TOL)
@@ -147,6 +190,8 @@ def _feasible_exclusions(solver: _LPSolver):
     pixel_count = solver.h * solver.w
     feasible = []
     for exclude in options:
+        # 启用阴影掩膜时，被选中的原照若整张被排除，掩膜自然失效：
+        # 该原照的观测本就不参与约束，不存在“单边约束仍生效”的问题。
         if all(solver.feasible(p, exclude) for p in range(pixel_count)):
             feasible.append(exclude)
     return feasible
@@ -205,6 +250,167 @@ def _fmt(value: float) -> str:
     if np.isposinf(value):
         return "+∞"
     return f"{value:.2f}"
+
+
+# --------------------------------------------------------------------------
+# 阴影诊断
+# --------------------------------------------------------------------------
+def _pixel_poly(grays: np.ndarray, lights: np.ndarray, shadow: bool,
+                source: int):
+    """单个像素在“阴影/非阴影”假设下的半空间集合 A r <= b。
+
+    全部原照都参与：阴影像素只把原照 source 的 ±2 换成单边
+    L_source . r >= g_source + SHADOW_MARGIN，其余约束不变。
+    """
+    k = len(lights)
+    rows_a, rows_b = [], []
+    for i in range(k):
+        light = lights[i]
+        g = grays[i]
+        if shadow and i == source:
+            rows_a.append(-light)
+            rows_b.append(-(g + SHADOW_MARGIN))
+            continue
+        rows_a.append(light)
+        rows_b.append(g + GRAY_TOL)
+        rows_a.append(-light)
+        rows_b.append(GRAY_TOL - g)
+    rows_a.append(np.array([0.0, 0.0, -1.0]))
+    rows_b.append(0.0)
+    return np.asarray(rows_a, dtype=np.float64), np.asarray(
+        rows_b, dtype=np.float64)
+
+
+def _pixel_feasible(grays: np.ndarray, lights: np.ndarray, shadow: bool,
+                    source: int) -> bool:
+    a, b = _pixel_poly(grays, lights, shadow, source)
+    # 零目标 LP：status 0 可行，2 不可行；其它状态说明求解异常，
+    # 不能当作“不可行”静默处理。
+    res = linprog(np.zeros(3), A_ub=a, b_ub=b,
+                  bounds=[(None, None)] * 3, method="highs")
+    if res.success:
+        return True
+    if res.status == 2:
+        return False
+    raise RuntimeError(f"阴影诊断 LP 求解失败 status={res.status}")
+
+
+def _min_boundary_labels(kinds: list, h: int, w: int):
+    """在给定强制标签下求四邻接边界最小的全部最优掩膜。
+
+    kinds[p]：0=强制非阴影，1=强制阴影，2=可自由选择（p = y*w+x）。
+    用一次 s-t 最小割（最大流）求最优解集合：
+    * 残量图中从源可达的像素在**每个**最优掩膜中都是阴影；
+    * 能到达汇的像素在**每个**最优掩膜中都不是阴影；
+    * 两者之外的像素在不同最优掩膜中有分歧。
+
+    返回 (最小边界边数, 公共阴影集, 分歧集)。"不得穷举掩膜"：复杂度为一次
+    最大流，与像素数多项式相关。
+    """
+    n = h * w
+    source, sink = n, n + 1
+    inf = 2 * n + 1  # 大于任何可能的边界边数
+    cap = np.zeros((n + 2, n + 2), dtype=np.int32)
+
+    for y in range(h):
+        for x in range(w):
+            p = y * w + x
+            if kinds[p] == 1:
+                cap[source, p] = inf
+            elif kinds[p] == 0:
+                cap[p, sink] = inf
+            if x + 1 < w:
+                q = p + 1
+                cap[p, q] += 1
+                cap[q, p] += 1
+            if y + 1 < h:
+                q = p + w
+                cap[p, q] += 1
+                cap[q, p] += 1
+
+    flow = maximum_flow(csr_matrix(cap), source, sink)
+    boundary = int(flow.flow_value)
+    residual = cap.astype(np.int64) - flow.flow.toarray().astype(np.int64)
+
+    def reach(start, matrix):
+        seen = np.zeros(n + 2, dtype=bool)
+        seen[start] = True
+        stack = [start]
+        while stack:
+            u = stack.pop()
+            for v in np.nonzero(matrix[u] > 0)[0]:
+                if not seen[v]:
+                    seen[v] = True
+                    stack.append(int(v))
+        return seen
+
+    from_source = reach(source, residual)
+    to_sink = reach(sink, residual.T)
+
+    all_shadow, ambiguous = [], []
+    for p in range(n):
+        if from_source[p]:
+            all_shadow.append((p % w, p // w))
+        elif not to_sink[p]:
+            ambiguous.append((p % w, p // w))
+    return boundary, all_shadow, ambiguous
+
+
+def diagnose_shadow(images: np.ndarray, lights: np.ndarray,
+                    source: int) -> dict:
+    """对选定原照做阴影诊断，返回最小边界掩膜与分歧像素。
+
+    * 全组原照参与，每个像素独立判定“阴影/非阴影”是否可行；
+    * 任一像素两种假设都不可行 → 观测冲突，无解；
+    * 否则用最小割求边界最短的可行掩膜；只有唯一最优掩膜时才可启用。
+    """
+    lights = np.asarray(lights, dtype=np.float64)
+    grays = np.asarray(images, dtype=np.float64)
+    k, h, w = grays.shape
+    if not (0 <= source < k):
+        raise ValueError("阴影诊断的原照索引越界")
+
+    kinds = [0] * (h * w)
+    conflict = []
+    for y in range(h):
+        for x in range(w):
+            g = grays[:, y, x]
+            normal_ok = _pixel_feasible(g, lights, False, source)
+            shadow_ok = _pixel_feasible(g, lights, True, source)
+            p = y * w + x
+            if not normal_ok and not shadow_ok:
+                conflict.append((x, y))
+            elif not normal_ok:
+                kinds[p] = 1
+            elif not shadow_ok:
+                kinds[p] = 0
+            else:
+                kinds[p] = 2
+
+    if conflict:
+        return {
+            "source": source,
+            "conflict": True,
+            "conflict_pixels": conflict,
+            "unique": False,
+            "boundary": None,
+            "all_shadow": [],
+            "ambiguous": [],
+            "mask": None,
+        }
+
+    boundary, all_shadow, ambiguous = _min_boundary_labels(kinds, h, w)
+    unique = len(ambiguous) == 0
+    return {
+        "source": source,
+        "conflict": False,
+        "conflict_pixels": [],
+        "unique": unique,
+        "boundary": boundary,
+        "all_shadow": all_shadow,
+        "ambiguous": ambiguous,
+        "mask": list(all_shadow) if unique else None,
+    }
 
 
 def evaluate(scene: Scene) -> dict:

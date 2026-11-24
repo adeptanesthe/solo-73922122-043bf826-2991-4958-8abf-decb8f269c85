@@ -14,8 +14,10 @@ $PY - <<'PYEOF'
 from app import app
 with app.test_client() as c:
     html = c.get('/demo').get_data(as_text=True)
+    shadow = c.get('/demo?scene=shadow').get_data(as_text=True)
 open('tests/dom_fixture.html', 'w', encoding='utf-8').write(html)
-print('已生成 tests/dom_fixture.html')
+open('tests/dom_fixture_shadow.html', 'w', encoding='utf-8').write(shadow)
+print('已生成 tests/dom_fixture.html 与 tests/dom_fixture_shadow.html')
 PYEOF
 
 node tests/dom_test.js
